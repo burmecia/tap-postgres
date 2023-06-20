@@ -202,8 +202,8 @@ class TapPostgres(SQLTap):
         if self.input_catalog:
             selected = [
                 stream
-                for stream self.input_catalog.to_dict()["streams"]
-                if stream.get("selected", True)
+                for stream in self.input_catalog.to_dict()["streams"]
+                if next(m for m in stream["metadata"] if not m["breadcrumb"])["metadata"]["selected"]
             ]
             return {"streams": selected}
 
