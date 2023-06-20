@@ -200,7 +200,12 @@ class TapPostgres(SQLTap):
             return self._catalog_dict
 
         if self.input_catalog:
-            return self.input_catalog.to_dict()
+            selected = [
+                stream
+                for stream self.input_catalog.to_dict()["streams"]
+                if stream.get("selected", True)
+            ]
+            return {"streams": selected}
 
         result: dict[str, list[dict]] = {"streams": []}
         result["streams"].extend(self.connector.discover_catalog_entries())
