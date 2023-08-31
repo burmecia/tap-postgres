@@ -4,15 +4,40 @@ This includes PostgresStream and PostgresConnector.
 """
 from __future__ import annotations
 
+import datetime
 from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional, Type, Union
 
+import singer_sdk.helpers._typing
 import sqlalchemy
 from singer_sdk import SQLConnector, SQLStream
 from singer_sdk import typing as th
 from singer_sdk.helpers._typing import TypeConformanceLevel
+from sqlalchemy.engine import Engine
+from sqlalchemy.engine.reflection import Inspector
 
 if TYPE_CHECKING:
     from sqlalchemy.dialects import postgresql
+
+unpatched_conform = singer_sdk.helpers._typing._conform_primitive_property
+
+
+def patched_conform(
+    elem: Any,
+    property_schema: dict,
+) -> Any:
+    """Overrides Singer SDK type conformance to prevent dates turning into datetimes.
+
+    Converts a primitive (i.e. not object or array) to a json compatible type.
+
+    Returns:
+        The appropriate json compatible type.
+    """
+    if isinstance(elem, datetime.date):
+        return elem.isoformat()
+    return unpatched_conform(elem=elem, property_schema=property_schema)
+
+
+singer_sdk.helpers._typing._conform_primitive_property = patched_conform
 
 
 class PostgresConnector(SQLConnector):
@@ -55,7 +80,7 @@ class PostgresConnector(SQLConnector):
         elif isinstance(sql_type, sqlalchemy.types.TypeEngine):
             type_name = type(sql_type).__name__
 
-        if type_name is not None and type_name == "JSONB":
+        if type_name is not None and type_name in ("JSONB", "JSON"):
             return th.ObjectType().type_dict
 
         if (
@@ -112,7 +137,7 @@ class PostgresConnector(SQLConnector):
             "datetime": th.DateTimeType(),
             "date": th.DateType(),
             "int": th.IntegerType(),
-            "number": th.NumberType(),
+            "numeric": th.NumberType(),
             "decimal": th.NumberType(),
             "double": th.NumberType(),
             "float": th.NumberType(),
@@ -141,6 +166,20 @@ class PostgresConnector(SQLConnector):
                 return jsonschema_type
 
         return sqltype_lookup["string"]  # safe failover to str
+
+    def get_schema_names(self, engine: Engine, inspected: Inspector) -> list[str]:
+        """Return a list of schema names in DB, or overrides with user-provided values.
+
+        Args:
+            engine: SQLAlchemy engine
+            inspected: SQLAlchemy inspector instance for engine
+
+        Returns:
+            List of schema names
+        """
+        if "filter_schemas" in self.config and len(self.config["filter_schemas"]) != 0:
+            return self.config["filter_schemas"]
+        return super().get_schema_names(engine, inspected)
 
 
 class PostgresStream(SQLStream):
