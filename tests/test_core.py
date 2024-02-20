@@ -5,23 +5,31 @@ import json
 
 import pendulum
 import pytest
-import sqlalchemy
+import sqlalchemy as sa
 from faker import Faker
 from singer_sdk.testing import get_tap_test_class, suites
 from singer_sdk.testing.runners import TapTestRunner
-from sqlalchemy import Column, DateTime, Integer, MetaData, Numeric, String, Table
-from sqlalchemy.dialects.postgresql import BIGINT, DATE, JSON, JSONB, TIME, TIMESTAMP
-from test_replication_key import TABLE_NAME, TapTestReplicationKey
-from test_selected_columns_only import (
+from sqlalchemy.dialects.postgresql import (
+    ARRAY,
+    BIGINT,
+    DATE,
+    JSON,
+    JSONB,
+    TIME,
+    TIMESTAMP,
+)
+
+from tap_postgres.tap import TapPostgres
+from tests.settings import DB_SCHEMA_NAME, DB_SQLALCHEMY_URL
+from tests.test_replication_key import TABLE_NAME, TapTestReplicationKey
+from tests.test_selected_columns_only import (
     TABLE_NAME_SELECTED_COLUMNS_ONLY,
     TapTestSelectedColumnsOnly,
 )
 
-from tap_postgres.tap import TapPostgres
-
 SAMPLE_CONFIG = {
     "start_date": pendulum.datetime(2022, 11, 1).to_iso8601_string(),
-    "sqlalchemy_url": "postgresql://postgres:postgres@localhost:5432/postgres",
+    "sqlalchemy_url": DB_SQLALCHEMY_URL,
 }
 
 NO_SQLALCHEMY_CONFIG = {
@@ -36,22 +44,22 @@ NO_SQLALCHEMY_CONFIG = {
 
 def setup_test_table(table_name, sqlalchemy_url):
     """setup any state specific to the execution of the given module."""
-    engine = sqlalchemy.create_engine(sqlalchemy_url)
+    engine = sa.create_engine(sqlalchemy_url, future=True)
     fake = Faker()
 
     date1 = datetime.date(2022, 11, 1)
     date2 = datetime.date(2022, 11, 30)
-    metadata_obj = MetaData()
-    test_replication_key_table = Table(
+    metadata_obj = sa.MetaData()
+    test_replication_key_table = sa.Table(
         table_name,
         metadata_obj,
-        Column("id", Integer, primary_key=True),
-        Column("updated_at", DateTime(), nullable=False),
-        Column("name", String()),
+        sa.Column("id", sa.Integer, primary_key=True),
+        sa.Column("updated_at", sa.DateTime(), nullable=False),
+        sa.Column("name", sa.String()),
     )
-    with engine.connect() as conn:
+    with engine.begin() as conn:
         metadata_obj.create_all(conn)
-        conn.execute(f"TRUNCATE TABLE {table_name}")
+        conn.execute(sa.text(f"TRUNCATE TABLE {table_name}"))
         for _ in range(1000):
             insert = test_replication_key_table.insert().values(
                 updated_at=fake.date_between(date1, date2), name=fake.name()
@@ -60,9 +68,9 @@ def setup_test_table(table_name, sqlalchemy_url):
 
 
 def teardown_test_table(table_name, sqlalchemy_url):
-    engine = sqlalchemy.create_engine(sqlalchemy_url)
-    with engine.connect() as conn:
-        conn.execute(f"DROP TABLE {table_name}")
+    engine = sa.create_engine(sqlalchemy_url, future=True)
+    with engine.begin() as conn:
+        conn.execute(sa.text(f"DROP TABLE {table_name}"))
 
 
 custom_test_replication_key = suites.TestSuite(
@@ -108,7 +116,7 @@ class TestTapPostgres(TapPostgresTest):
         teardown_test_table(self.table_name, self.sqlalchemy_url)
 
 
-class TestTapPostgres_NOSQLALCHMY(TapPostgresTestNOSQLALCHEMY):
+class TestTapPostgres_NOSQLALCHMY(TapPostgresTestNOSQLALCHEMY):  # noqa: N801
     table_name = TABLE_NAME
     sqlalchemy_url = SAMPLE_CONFIG["sqlalchemy_url"]
 
@@ -136,20 +144,19 @@ def test_temporal_datatypes():
     This test checks that dates are being parsed correctly, and additionally implements
     schema checks, and performs similar tests on times and timestamps.
     """
-    table_name = "test_date"
-    engine = sqlalchemy.create_engine(SAMPLE_CONFIG["sqlalchemy_url"])
+    table_name = "test_temporal_datatypes"
+    engine = sa.create_engine(SAMPLE_CONFIG["sqlalchemy_url"], future=True)
 
-    metadata_obj = MetaData()
-    table = Table(
+    metadata_obj = sa.MetaData()
+    table = sa.Table(
         table_name,
         metadata_obj,
-        Column("column_date", DATE),
-        Column("column_time", TIME),
-        Column("column_timestamp", TIMESTAMP),
+        sa.Column("column_date", DATE),
+        sa.Column("column_time", TIME),
+        sa.Column("column_timestamp", TIMESTAMP),
     )
-    with engine.connect() as conn:
-        if table.exists(conn):
-            table.drop(conn)
+    with engine.begin() as conn:
+        table.drop(conn, checkfirst=True)
         metadata_obj.create_all(conn)
         insert = table.insert().values(
             column_date="2022-03-19",
@@ -159,7 +166,7 @@ def test_temporal_datatypes():
         conn.execute(insert)
     tap = TapPostgres(config=SAMPLE_CONFIG)
     tap_catalog = json.loads(tap.catalog_json_text)
-    altered_table_name = f"public-{table_name}"
+    altered_table_name = f"{DB_SCHEMA_NAME}-{table_name}"
     for stream in tap_catalog["streams"]:
         if stream.get("stream") and altered_table_name not in stream["stream"]:
             for metadata in stream["metadata"]:
@@ -180,12 +187,12 @@ def test_temporal_datatypes():
             and schema_message["stream"] == altered_table_name
         ):
             assert (
-                "date"
-                == schema_message["schema"]["properties"]["column_date"]["format"]
+                schema_message["schema"]["properties"]["column_date"]["format"]
+                == "date"
             )
             assert (
-                "date-time"
-                == schema_message["schema"]["properties"]["column_timestamp"]["format"]
+                schema_message["schema"]["properties"]["column_timestamp"]["format"]
+                == "date-time"
             )
     assert test_runner.records[altered_table_name][0] == {
         "column_date": "2022-03-19",
@@ -195,29 +202,35 @@ def test_temporal_datatypes():
 
 
 def test_jsonb_json():
-    """JSONB and JSON Objects weren't being selected, make sure they are now"""
+    """JSONB and JSON Objects weren't being selected, make sure they are now."""
     table_name = "test_jsonb_json"
-    engine = sqlalchemy.create_engine(SAMPLE_CONFIG["sqlalchemy_url"])
+    engine = sa.create_engine(SAMPLE_CONFIG["sqlalchemy_url"], future=True)
 
-    metadata_obj = MetaData()
-    table = Table(
+    metadata_obj = sa.MetaData()
+    table = sa.Table(
         table_name,
         metadata_obj,
-        Column("column_jsonb", JSONB),
-        Column("column_json", JSON),
+        sa.Column("column_jsonb", JSONB),
+        sa.Column("column_json", JSON),
     )
-    with engine.connect() as conn:
-        if table.exists(conn):
-            table.drop(conn)
+
+    rows = [
+        {"column_jsonb": {"foo": "bar"}, "column_json": {"baz": "foo"}},
+        {"column_jsonb": 3.14, "column_json": -9.3},
+        {"column_jsonb": 22, "column_json": 10000000},
+        {"column_jsonb": {}, "column_json": {}},
+        {"column_jsonb": ["bar", "foo"], "column_json": ["foo", "baz"]},
+        {"column_jsonb": True, "column_json": False},
+    ]
+
+    with engine.begin() as conn:
+        table.drop(conn, checkfirst=True)
         metadata_obj.create_all(conn)
-        insert = table.insert().values(
-            column_jsonb={"foo": "bar"},
-            column_json={"baz": "foo"},
-        )
+        insert = table.insert().values(rows)
         conn.execute(insert)
     tap = TapPostgres(config=SAMPLE_CONFIG)
     tap_catalog = json.loads(tap.catalog_json_text)
-    altered_table_name = f"public-{table_name}"
+    altered_table_name = f"{DB_SCHEMA_NAME}-{table_name}"
     for stream in tap_catalog["streams"]:
         if stream.get("stream") and altered_table_name not in stream["stream"]:
             for metadata in stream["metadata"]:
@@ -237,28 +250,108 @@ def test_jsonb_json():
             "stream" in schema_message
             and schema_message["stream"] == altered_table_name
         ):
-            assert "object" in schema_message["schema"]["properties"]["column_jsonb"]["type"]
-            assert "object" in schema_message["schema"]["properties"]["column_json"]["type"]
-    assert test_runner.records[altered_table_name][0] == {
-        "column_jsonb": {"foo": "bar"},
-        "column_json": {"baz": "foo"}
-    }
+            assert schema_message["schema"]["properties"]["column_jsonb"] == {
+                "type": [
+                    "string",
+                    "number",
+                    "integer",
+                    "array",
+                    "object",
+                    "boolean",
+                    "null",
+                ]
+            }
+            assert schema_message["schema"]["properties"]["column_json"] == {
+                "type": [
+                    "string",
+                    "number",
+                    "integer",
+                    "array",
+                    "object",
+                    "boolean",
+                    "null",
+                ]
+            }
+    for i in range(len(rows)):
+        assert test_runner.records[altered_table_name][i] == rows[i]
+
+
+def test_jsonb_array():
+    """ARRAYS of JSONB objects had incorrect schemas. See issue #331."""
+    table_name = "test_jsonb_array"
+    engine = sa.create_engine(SAMPLE_CONFIG["sqlalchemy_url"], future=True)
+
+    metadata_obj = sa.MetaData()
+    table = sa.Table(
+        table_name,
+        metadata_obj,
+        sa.Column("column_jsonb_array", ARRAY(JSONB)),
+    )
+
+    rows = [
+        {"column_jsonb_array": [{"foo": "bar"}]},
+        {"column_jsonb_array": [{"foo": 42}]},
+        {"column_jsonb_array": [{"foo": 1.414}]},
+        {"column_jsonb_array": [{"abc": "def"}, {"ghi": "jkl"}, {"mno": "pqr"}]},
+    ]
+
+    with engine.begin() as conn:
+        table.drop(conn, checkfirst=True)
+        metadata_obj.create_all(conn)
+        insert = table.insert().values(rows)
+        conn.execute(insert)
+    tap = TapPostgres(config=SAMPLE_CONFIG)
+    tap_catalog = json.loads(tap.catalog_json_text)
+    altered_table_name = f"{DB_SCHEMA_NAME}-{table_name}"
+    for stream in tap_catalog["streams"]:
+        if stream.get("stream") and altered_table_name not in stream["stream"]:
+            for metadata in stream["metadata"]:
+                metadata["metadata"]["selected"] = False
+        else:
+            for metadata in stream["metadata"]:
+                metadata["metadata"]["selected"] = True
+                if metadata["breadcrumb"] == []:
+                    metadata["metadata"]["replication-method"] = "FULL_TABLE"
+
+    test_runner = PostgresTestRunner(
+        tap_class=TapPostgres, config=SAMPLE_CONFIG, catalog=tap_catalog
+    )
+    test_runner.sync_all()
+    for schema_message in test_runner.schema_messages:
+        if (
+            "stream" in schema_message
+            and schema_message["stream"] == altered_table_name
+        ):
+            assert schema_message["schema"]["properties"]["column_jsonb_array"] == {
+                "items": {
+                    "type": [
+                        "string",
+                        "number",
+                        "integer",
+                        "array",
+                        "object",
+                        "boolean",
+                    ]
+                },
+                "type": ["array", "null"],
+            }
+    for i in range(len(rows)):
+        assert test_runner.records[altered_table_name][i] == rows[i]
 
 
 def test_decimal():
     """Schema was wrong for Decimal objects. Check they are correctly selected."""
     table_name = "test_decimal"
-    engine = sqlalchemy.create_engine(SAMPLE_CONFIG["sqlalchemy_url"])
+    engine = sa.create_engine(SAMPLE_CONFIG["sqlalchemy_url"], future=True)
 
-    metadata_obj = MetaData()
-    table = Table(
+    metadata_obj = sa.MetaData()
+    table = sa.Table(
         table_name,
         metadata_obj,
-        Column("column", Numeric()),
+        sa.Column("column", sa.Numeric()),
     )
-    with engine.connect() as conn:
-        if table.exists(conn):
-            table.drop(conn)
+    with engine.begin() as conn:
+        table.drop(conn, checkfirst=True)
         metadata_obj.create_all(conn)
         insert = table.insert().values(column=decimal.Decimal("3.14"))
         conn.execute(insert)
@@ -268,7 +361,7 @@ def test_decimal():
         conn.execute(insert)
     tap = TapPostgres(config=SAMPLE_CONFIG)
     tap_catalog = json.loads(tap.catalog_json_text)
-    altered_table_name = f"public-{table_name}"
+    altered_table_name = f"{DB_SCHEMA_NAME}-{table_name}"
     for stream in tap_catalog["streams"]:
         if stream.get("stream") and altered_table_name not in stream["stream"]:
             for metadata in stream["metadata"]:
@@ -294,15 +387,19 @@ def test_decimal():
 def test_filter_schemas():
     """Only return tables from a given schema"""
     table_name = "test_filter_schemas"
-    engine = sqlalchemy.create_engine(SAMPLE_CONFIG["sqlalchemy_url"])
+    engine = sa.create_engine(SAMPLE_CONFIG["sqlalchemy_url"], future=True)
 
-    metadata_obj = MetaData()
-    table = Table(table_name, metadata_obj, Column("id", BIGINT), schema="new_schema")
+    metadata_obj = sa.MetaData()
+    table = sa.Table(
+        table_name,
+        metadata_obj,
+        sa.Column("id", BIGINT),
+        schema="new_schema",
+    )
 
-    with engine.connect() as conn:
-        conn.execute("CREATE SCHEMA IF NOT EXISTS new_schema")
-        if table.exists(conn):
-            table.drop(conn)
+    with engine.begin() as conn:
+        conn.execute(sa.text("CREATE SCHEMA IF NOT EXISTS new_schema"))
+        table.drop(conn, checkfirst=True)
         metadata_obj.create_all(conn)
     filter_schemas_config = copy.deepcopy(SAMPLE_CONFIG)
     filter_schemas_config.update({"filter_schemas": ["new_schema"]})
@@ -316,10 +413,92 @@ def test_filter_schemas():
 
 class PostgresTestRunner(TapTestRunner):
     def run_sync_dry_run(self) -> bool:
-        """
-        Dislike this function and how TestRunner does this so just hacking it here.
+        """Dislike this function and how TestRunner does this so just hacking it here.
+
         Want to be able to run exactly the catalog given
         """
         new_tap = self.new_tap()
         new_tap.sync_all()
         return True
+
+
+def test_invalid_python_dates():  # noqa: PLR0912
+    """Some dates are invalid in python, but valid in Postgres.
+
+    Check out https://www.psycopg.org/psycopg3/docs/advanced/adapt.html#example-handling-infinity-date
+    for more information.
+    """
+    table_name = "test_invalid_python_dates"
+    engine = sa.create_engine(SAMPLE_CONFIG["sqlalchemy_url"], future=True)
+
+    metadata_obj = sa.MetaData()
+    table = sa.Table(
+        table_name,
+        metadata_obj,
+        sa.Column("date", DATE),
+        sa.Column("datetime", sa.DateTime),
+    )
+    with engine.begin() as conn:
+        table.drop(conn, checkfirst=True)
+        metadata_obj.create_all(conn)
+        insert = table.insert().values(
+            date="4713-04-03 BC",
+            datetime="4712-10-19 10:23:54 BC",
+        )
+        conn.execute(insert)
+    tap = TapPostgres(config=SAMPLE_CONFIG)
+    # Alter config and then check the data comes through as a string
+    tap_catalog = json.loads(tap.catalog_json_text)
+    altered_table_name = f"{DB_SCHEMA_NAME}-{table_name}"
+    for stream in tap_catalog["streams"]:
+        if stream.get("stream") and altered_table_name not in stream["stream"]:
+            for metadata in stream["metadata"]:
+                metadata["metadata"]["selected"] = False
+        else:
+            for metadata in stream["metadata"]:
+                metadata["metadata"]["selected"] = True
+                if metadata["breadcrumb"] == []:
+                    metadata["metadata"]["replication-method"] = "FULL_TABLE"
+
+    test_runner = PostgresTestRunner(
+        tap_class=TapPostgres, config=SAMPLE_CONFIG, catalog=tap_catalog
+    )
+    with pytest.raises(ValueError):
+        test_runner.sync_all()
+
+    copied_config = copy.deepcopy(SAMPLE_CONFIG)
+    # This should cause the same data to pass
+    copied_config["dates_as_string"] = True
+    tap = TapPostgres(config=copied_config)
+    tap_catalog = json.loads(tap.catalog_json_text)
+    altered_table_name = f"{DB_SCHEMA_NAME}-{table_name}"
+    for stream in tap_catalog["streams"]:
+        if stream.get("stream") and altered_table_name not in stream["stream"]:
+            for metadata in stream["metadata"]:
+                metadata["metadata"]["selected"] = False
+        else:
+            for metadata in stream["metadata"]:
+                metadata["metadata"]["selected"] = True
+                if metadata["breadcrumb"] == []:
+                    metadata["metadata"]["replication-method"] = "FULL_TABLE"
+
+    test_runner = PostgresTestRunner(
+        tap_class=TapPostgres, config=SAMPLE_CONFIG, catalog=tap_catalog
+    )
+    test_runner.sync_all()
+
+    for schema_message in test_runner.schema_messages:
+        if (
+            "stream" in schema_message
+            and schema_message["stream"] == altered_table_name
+        ):
+            assert ["string", "null"] == schema_message["schema"]["properties"]["date"][
+                "type"
+            ]
+            assert ["string", "null"] == schema_message["schema"]["properties"][
+                "datetime"
+            ]["type"]
+    assert test_runner.records[altered_table_name][0] == {
+        "date": "4713-04-03 BC",
+        "datetime": "4712-10-19 10:23:54 BC",
+    }

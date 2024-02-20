@@ -8,30 +8,22 @@ on:
   workflow_dispatch:
     inputs: {}
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   tests:
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres
-        env:
-          POSTGRES_PASSWORD: postgres
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
     env:
       PIP_CONSTRAINT: .github/workflows/constraints.txt
     strategy:
       matrix:
-        python-version: ["3.8", "3.9", "3.10", "3.11"]
+        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12"]
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v3.5.2
+      uses: actions/checkout@v4
 
     - name: Fix Permissions
       run: |
@@ -40,9 +32,12 @@ jobs:
         sudo chown 999:999 ssl/server.key
         chmod 600 ssl/pkey.key
 
-    - name: Set up Postgres container
+    - name: Build Postgres container
       run: |
-        docker compose -f docker-compose.yml up -d
+        docker build . --tag meltano/log_based
+    - name: Compose Postgres container
+      run: |
+        docker compose -f docker-compose.yml up -d --wait --wait-timeout=30
 
     - uses: isbang/compose-action@v1.5.1
 
@@ -55,7 +50,7 @@ jobs:
 
 
     - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v4.6.0
+      uses: actions/setup-python@v5
       with:
         python-version: ${{ matrix.python-version }}
 

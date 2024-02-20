@@ -2,20 +2,34 @@
 from __future__ import annotations
 
 import atexit
+import copy
 import io
 import signal
+import sys
 from functools import cached_property
 from os import chmod, path
-from typing import Any, Mapping, cast
+from typing import TYPE_CHECKING, Any, Sequence, cast
 
 import paramiko
-from singer_sdk import SQLTap, Stream
-from singer_sdk import typing as th  # JSON schema typing helpers
+from singer_sdk import SQLStream, SQLTap, Stream
+from singer_sdk import typing as th
+from singer_sdk._singerlib import (  # JSON schema typing helpers
+    Catalog,
+    Metadata,
+    Schema,
+)
 from sqlalchemy.engine import URL
 from sqlalchemy.engine.url import make_url
 from sshtunnel import SSHTunnelForwarder
 
-from tap_postgres.client import PostgresConnector, PostgresStream
+from tap_postgres.client import (
+    PostgresConnector,
+    PostgresLogBasedStream,
+    PostgresStream,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 
 class TapPostgres(SQLTap):
@@ -44,6 +58,11 @@ class TapPostgres(SQLTap):
             "Need either the sqlalchemy_url to be set or host, port, user,"
             + " and password to be set"
         )
+
+        # If log-based replication is used, sqlalchemy_url can't be used.
+        assert (self.config.get("sqlalchemy_url") is None) or (
+            self.config.get("replication_mode") != "LOG_BASED"
+        ), "A sqlalchemy_url can't be used with log-based replication"
 
         # If sqlalchemy_url is not being used and ssl_enable is on, ssl_mode must have
         # one of six allowable values. If ssl_mode is verify-ca or verify-full, a
@@ -138,6 +157,16 @@ class TapPostgres(SQLTap):
             ),
         ),
         th.Property(
+            "dates_as_string",
+            th.BooleanType,
+            description=(
+                "Defaults to false, if true, date, and timestamp fields will be "
+                "Strings. If you see ValueError: Year is out of range, "
+                "try setting this to True."
+            ),
+            default=False,
+        ),
+        th.Property(
             "ssh_tunnel",
             th.ObjectType(
                 th.Property(
@@ -222,7 +251,7 @@ class TapPostgres(SQLTap):
             th.StringType,
             default="verify-full",
             description=(
-                "SSL Protection method, see [postgres documentation](https://www.postgresql.org/docs/current/libpq-ssl.html#LIBPQ-SSL-PROTECTION)"  # noqa: E501
+                "SSL Protection method, see [postgres documentation](https://www.postgresql.org/docs/current/libpq-ssl.html#LIBPQ-SSL-PROTECTION)"
                 + " for more information. Must be one of disable, allow, prefer,"
                 + " require, verify-ca, or verify-full."
                 + " Note if sqlalchemy_url is set this will be ignored."
@@ -272,6 +301,16 @@ class TapPostgres(SQLTap):
                 + " configuration option determines where that file is created."
             ),
         ),
+        th.Property(
+            "default_replication_method",
+            th.StringType,
+            default="FULL_TABLE",
+            allowed_values=["FULL_TABLE", "INCREMENTAL", "LOG_BASED"],
+            description=(
+                "Replication method to use if there is not a catalog entry to override "
+                "this choice. One of `FULL_TABLE`, `INCREMENTAL`, or `LOG_BASED`."
+            ),
+        ),
     ).to_dict()
 
     def get_sqlalchemy_url(self, config: Mapping[str, Any]) -> str:
@@ -283,19 +322,18 @@ class TapPostgres(SQLTap):
         if config.get("sqlalchemy_url"):
             return cast(str, config["sqlalchemy_url"])
 
-        else:
-            sqlalchemy_url = URL.create(
-                drivername="postgresql+psycopg2",
-                username=config["user"],
-                password=config["password"],
-                host=config["host"],
-                port=config["port"],
-                database=config["database"],
-                query=self.get_sqlalchemy_query(config=config),
-            )
-            return cast(str, sqlalchemy_url)
+        sqlalchemy_url = URL.create(
+            drivername="postgresql+psycopg2",
+            username=config["user"],
+            password=config["password"],
+            host=config["host"],
+            port=config["port"],
+            database=config["database"],
+            query=self.get_sqlalchemy_query(config=config),
+        )
+        return cast(str, sqlalchemy_url)
 
-    def get_sqlalchemy_query(self, config: dict) -> dict:
+    def get_sqlalchemy_query(self, config: Mapping[str, Any]) -> dict:
         """Get query values to be used for sqlalchemy URL creation.
 
         Args:
@@ -355,12 +393,13 @@ class TapPostgres(SQLTap):
         """
         if path.isfile(value):
             return value
-        else:
-            with open(alternative_name, "wb") as alternative_file:
-                alternative_file.write(value.encode("utf-8"))
-            if restrict_permissions:
-                chmod(alternative_name, 0o600)
-            return alternative_name
+
+        with open(alternative_name, "wb") as alternative_file:
+            alternative_file.write(value.encode("utf-8"))
+        if restrict_permissions:
+            chmod(alternative_name, 0o600)
+
+        return alternative_name
 
     @cached_property
     def connector(self) -> PostgresConnector:
@@ -404,8 +443,8 @@ class TapPostgres(SQLTap):
             paramiko.Ed25519Key,
         ):
             try:
-                key = key_class.from_private_key(io.StringIO(key_data))  # type: ignore[attr-defined]  # noqa: E501
-            except paramiko.SSHException:
+                key = key_class.from_private_key(io.StringIO(key_data))  # type: ignore[attr-defined]
+            except paramiko.SSHException:  # noqa: PERF203
                 continue
             else:
                 return key
@@ -456,11 +495,13 @@ class TapPostgres(SQLTap):
             signum: The signal number
             frame: The current stack frame
         """
-        exit(1)  # Calling this to be sure atexit is called, so clean_up gets called
+        sys.exit(1)  # Calling this to be sure atexit is called, so clean_up gets called
 
     @property
     def catalog_dict(self) -> dict:
         """Get catalog dictionary.
+
+        Override to prevent premature instantiation of the connector.
 
         Returns:
             The tap's catalog as a dict
@@ -482,13 +523,84 @@ class TapPostgres(SQLTap):
         self._catalog_dict: dict = result
         return self._catalog_dict
 
-    def discover_streams(self) -> list[Stream]:
+    @property
+    def catalog(self) -> Catalog:
+        """Get the tap's working catalog.
+
+        Override to do LOG_BASED modifications.
+
+        Returns:
+            A Singer catalog object.
+        """
+        new_catalog: Catalog = Catalog()
+        modified_streams: list = []
+        for stream in super().catalog.streams:
+            stream_modified = False
+            new_stream = copy.deepcopy(stream)
+            if (
+                new_stream.replication_method == "LOG_BASED"
+                and new_stream.schema.properties
+            ):
+                for property in new_stream.schema.properties.values():
+                    if "null" not in property.type:
+                        if isinstance(property.type, list):
+                            property.type.append("null")
+                        else:
+                            property.type = [property.type, "null"]
+                if new_stream.schema.required:
+                    stream_modified = True
+                    new_stream.schema.required = None
+                if "_sdc_deleted_at" not in new_stream.schema.properties:
+                    stream_modified = True
+                    new_stream.schema.properties.update(
+                        {"_sdc_deleted_at": Schema(type=["string", "null"])}
+                    )
+                    new_stream.metadata.update(
+                        {
+                            ("properties", "_sdc_deleted_at"): Metadata(
+                                Metadata.InclusionType.AVAILABLE, True, None
+                            )
+                        }
+                    )
+                if "_sdc_lsn" not in new_stream.schema.properties:
+                    stream_modified = True
+                    new_stream.schema.properties.update(
+                        {"_sdc_lsn": Schema(type=["integer", "null"])}
+                    )
+                    new_stream.metadata.update(
+                        {
+                            ("properties", "_sdc_lsn"): Metadata(
+                                Metadata.InclusionType.AVAILABLE, True, None
+                            )
+                        }
+                    )
+            if stream_modified:
+                modified_streams.append(new_stream.tap_stream_id)
+            new_catalog.add_stream(new_stream)
+        if modified_streams:
+            self.logger.info(
+                "One or more LOG_BASED catalog entries were modified "
+                f"({modified_streams=}) to allow nullability and include _sdc columns. "
+                "See README for further information."
+            )
+        return new_catalog
+
+    def discover_streams(self) -> Sequence[Stream]:
         """Initialize all available streams and return them as a list.
 
         Returns:
             List of discovered Stream objects.
         """
-        return [
-            PostgresStream(self, catalog_entry, connector=self.connector)
-            for catalog_entry in self.catalog_dict["streams"]
-        ]
+        streams: list[SQLStream] = []
+        for catalog_entry in self.catalog_dict["streams"]:
+            if catalog_entry["replication_method"] == "LOG_BASED":
+                streams.append(
+                    PostgresLogBasedStream(
+                        self, catalog_entry, connector=self.connector
+                    )
+                )
+            else:
+                streams.append(
+                    PostgresStream(self, catalog_entry, connector=self.connector)
+                )
+        return streams
