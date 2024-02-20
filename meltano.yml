@@ -14,14 +14,14 @@ plugins:
       sqlalchemy_url: "postgresql://postgres:postgres@localhost:5432/postgres"
     settings:
     - name: sqlalchemy_url
-      kind: password
+      sensitive: true
     - name: ssh_tunnel.enable
       kind: boolean
       value: false
     - name: ssh_tunnel.private_key
-      kind: password
+      sensitive: true
     - name: ssh_tunnel.private_key_password
-      kind: password
+      sensitive: true
     - name: ssh_tunnel.host
     - name: ssh_tunnel.username
     - name: ssh_tunnel.port
@@ -31,11 +31,11 @@ plugins:
       kind: boolean
     - name: ssl_mode
     - name: ssl_certificate_authority
-      kind: password
+      sensitive: true
     - name: ssl_client_certificate
-      kind: password
+      sensitive: true
     - name: ssl_client_private_key
-      kind: password
+      sensitive: true
     select:
     - "*.*"
   loaders:
