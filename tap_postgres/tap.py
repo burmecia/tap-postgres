@@ -1,4 +1,5 @@
 """Postgres tap class."""
+
 from __future__ import annotations
 
 import atexit
@@ -137,6 +138,15 @@ class TapPostgres(SQLTap):
             description=(
                 "Database name. "
                 + "Note if sqlalchemy_url is set this will be ignored."
+            ),
+        ),
+        th.Property(
+            "max_record_count",
+            th.IntegerType,
+            default=None,
+            description=(
+                "Optional. The maximum number of records to return in a "
+                "single stream."
             ),
         ),
         th.Property(
@@ -443,7 +453,7 @@ class TapPostgres(SQLTap):
             paramiko.Ed25519Key,
         ):
             try:
-                key = key_class.from_private_key(io.StringIO(key_data))  # type: ignore[attr-defined]
+                key = key_class.from_private_key(io.StringIO(key_data))
             except paramiko.SSHException:  # noqa: PERF203
                 continue
             else:

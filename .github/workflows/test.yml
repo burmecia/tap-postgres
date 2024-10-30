@@ -2,9 +2,32 @@ name: Test tap-postgres
 
 on:
   pull_request:
+    branches: [main]
     types: [opened, synchronize, reopened]
+    paths:
+    - .github/workflows/test.yml
+    - log_based/**
+    - pagila/**
+    - ssh_tunnel/**
+    - ssl/**
+    - tap_postgres/**
+    - tests/**
+    - poetry.lock
+    - pyproject.toml
+    - tox.ini
   push:
     branches: [main]
+    paths:
+    - .github/workflows/test.yml
+    - log_based/**
+    - pagila/**
+    - ssh_tunnel/**
+    - ssl/**
+    - tap_postgres/**
+    - tests/**
+    - poetry.lock
+    - pyproject.toml
+    - tox.ini
   workflow_dispatch:
     inputs: {}
 
@@ -16,10 +39,16 @@ jobs:
   tests:
     runs-on: ubuntu-latest
     env:
-      PIP_CONSTRAINT: .github/workflows/constraints.txt
+      PIP_CONSTRAINT: ${{ github.workspace }}/.github/workflows/constraints.txt
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12"]
+        python-version:
+        - "3.12"
+        - "3.11"
+        - "3.10"
+        - "3.9"
+        - "3.8"
 
     steps:
     - name: Checkout code
@@ -39,7 +68,7 @@ jobs:
       run: |
         docker compose -f docker-compose.yml up -d --wait --wait-timeout=30
 
-    - uses: isbang/compose-action@v1.5.1
+    - uses: isbang/compose-action@v2.0.2
 
  # Leaving comments as this makes testing the openssh docker image easier and should save someone some time later
  #   - name: Test SSH File Permissiosn
@@ -53,6 +82,7 @@ jobs:
       uses: actions/setup-python@v5
       with:
         python-version: ${{ matrix.python-version }}
+        allow-prereleases: true
 
     - name: Upgrade pip
       run: |
@@ -64,6 +94,7 @@ jobs:
         poetry --version
     - name: Install dependencies
       run: |
+        poetry env use python${{ matrix.python-version }}
         poetry install
     - name: Run pytest
       run: |

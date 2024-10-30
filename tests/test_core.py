@@ -3,7 +3,6 @@ import datetime
 import decimal
 import json
 
-import pendulum
 import pytest
 import sqlalchemy as sa
 from faker import Faker
@@ -28,12 +27,12 @@ from tests.test_selected_columns_only import (
 )
 
 SAMPLE_CONFIG = {
-    "start_date": pendulum.datetime(2022, 11, 1).to_iso8601_string(),
+    "start_date": datetime.datetime(2022, 11, 1).isoformat(),
     "sqlalchemy_url": DB_SQLALCHEMY_URL,
 }
 
 NO_SQLALCHEMY_CONFIG = {
-    "start_date": pendulum.datetime(2022, 11, 1).to_iso8601_string(),
+    "start_date": datetime.datetime(2022, 11, 1).isoformat(),
     "host": "localhost",
     "port": 5432,
     "user": "postgres",
@@ -339,7 +338,7 @@ def test_jsonb_array():
         assert test_runner.records[altered_table_name][i] == rows[i]
 
 
-def test_decimal():
+def test_numeric_types():
     """Schema was wrong for Decimal objects. Check they are correctly selected."""
     table_name = "test_decimal"
     engine = sa.create_engine(SAMPLE_CONFIG["sqlalchemy_url"], future=True)
@@ -348,20 +347,31 @@ def test_decimal():
     table = sa.Table(
         table_name,
         metadata_obj,
-        sa.Column("column", sa.Numeric()),
+        sa.Column("my_numeric", sa.Numeric()),
+        sa.Column("my_real", sa.REAL()),
     )
     with engine.begin() as conn:
         table.drop(conn, checkfirst=True)
         metadata_obj.create_all(conn)
-        insert = table.insert().values(column=decimal.Decimal("3.14"))
+        insert = table.insert().values(
+            my_numeric=decimal.Decimal("3.14"),
+            my_real=3.14,
+        )
         conn.execute(insert)
-        insert = table.insert().values(column=decimal.Decimal("12"))
+        insert = table.insert().values(
+            my_numeric=decimal.Decimal("12"),
+            my_real=12,
+        )
         conn.execute(insert)
-        insert = table.insert().values(column=decimal.Decimal("10000.00001"))
+        insert = table.insert().values(
+            my_numeric=decimal.Decimal("10000.00001"),
+            my_real=10000.00001,
+        )
         conn.execute(insert)
     tap = TapPostgres(config=SAMPLE_CONFIG)
     tap_catalog = json.loads(tap.catalog_json_text)
     altered_table_name = f"{DB_SCHEMA_NAME}-{table_name}"
+
     for stream in tap_catalog["streams"]:
         if stream.get("stream") and altered_table_name not in stream["stream"]:
             for metadata in stream["metadata"]:
@@ -376,12 +386,15 @@ def test_decimal():
         tap_class=TapPostgres, config=SAMPLE_CONFIG, catalog=tap_catalog
     )
     test_runner.sync_all()
+
     for schema_message in test_runner.schema_messages:
         if (
             "stream" in schema_message
             and schema_message["stream"] == altered_table_name
         ):
-            assert "number" in schema_message["schema"]["properties"]["column"]["type"]
+            props = schema_message["schema"]["properties"]
+            assert "number" in props["my_numeric"]["type"]
+            assert "number" in props["my_real"]["type"]
 
 
 def test_filter_schemas():
@@ -492,12 +505,14 @@ def test_invalid_python_dates():  # noqa: PLR0912
             "stream" in schema_message
             and schema_message["stream"] == altered_table_name
         ):
-            assert ["string", "null"] == schema_message["schema"]["properties"]["date"][
-                "type"
+            assert schema_message["schema"]["properties"]["date"]["type"] == [
+                "string",
+                "null",
             ]
-            assert ["string", "null"] == schema_message["schema"]["properties"][
-                "datetime"
-            ]["type"]
+            assert schema_message["schema"]["properties"]["datetime"]["type"] == [
+                "string",
+                "null",
+            ]
     assert test_runner.records[altered_table_name][0] == {
         "date": "4713-04-03 BC",
         "datetime": "4712-10-19 10:23:54 BC",

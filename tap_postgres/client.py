@@ -6,29 +6,70 @@ This includes PostgresStream and PostgresConnector.
 from __future__ import annotations
 
 import datetime
+import functools
 import json
 import select
-import typing
+import typing as t
 from functools import cached_property
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Iterable, Mapping
 
-import pendulum
 import psycopg2
 import singer_sdk.helpers._typing
 import sqlalchemy as sa
+import sqlalchemy.types
 from psycopg2 import extras
 from singer_sdk import SQLConnector, SQLStream
-from singer_sdk import typing as th
+from singer_sdk.connectors.sql import SQLToJSONSchema
 from singer_sdk.helpers._state import increment_state
 from singer_sdk.helpers._typing import TypeConformanceLevel
 from singer_sdk.streams.core import REPLICATION_INCREMENTAL
+from sqlalchemy.dialects import postgresql
 
 if TYPE_CHECKING:
+    from singer_sdk.helpers.types import Context
     from sqlalchemy.dialects import postgresql
     from sqlalchemy.engine import Engine
     from sqlalchemy.engine.reflection import Inspector
-    from sqlalchemy.types import TypeEngine
+
+
+class PostgresSQLToJSONSchema(SQLToJSONSchema):
+    """Custom SQL to JSON Schema conversion for Postgres."""
+
+    def __init__(self, dates_as_string: bool, *args, **kwargs):
+        """Initialize the SQL to JSON Schema converter."""
+        super().__init__(*args, **kwargs)
+        self.dates_as_string = dates_as_string
+
+    @SQLToJSONSchema.to_jsonschema.register  # type: ignore[attr-defined]
+    def array_to_jsonschema(self, column_type: postgresql.ARRAY) -> dict:
+        """Override the default mapping for NUMERIC columns.
+
+        For example, a scale of 4 translates to a multipleOf 0.0001.
+        """
+        return {
+            "type": "array",
+            "items": self.to_jsonschema(column_type.item_type),
+        }
+
+    @SQLToJSONSchema.to_jsonschema.register  # type: ignore[attr-defined]
+    def json_to_jsonschema(self, column_type: postgresql.JSON) -> dict:
+        """Override the default mapping for JSON and JSONB columns."""
+        return {"type": ["string", "number", "integer", "array", "object", "boolean"]}
+
+    @SQLToJSONSchema.to_jsonschema.register  # type: ignore[attr-defined]
+    def datetime_to_jsonschema(self, column_type: sqlalchemy.types.DateTime) -> dict:
+        """Override the default mapping for DATETIME columns."""
+        if self.dates_as_string:
+            return {"type": ["string", "null"]}
+        return super().datetime_to_jsonschema(column_type)
+
+    @SQLToJSONSchema.to_jsonschema.register  # type: ignore[attr-defined]
+    def date_to_jsonschema(self, column_type: sqlalchemy.types.Date) -> dict:
+        """Override the default mapping for DATE columns."""
+        if self.dates_as_string:
+            return {"type": ["string", "null"]}
+        return super().date_to_jsonschema(column_type)
 
 
 def patched_conform(
@@ -58,7 +99,7 @@ def patched_conform(
     """
     if isinstance(elem, datetime.date):  # not copied, original logic
         return elem.isoformat()
-    if isinstance(elem, (datetime.datetime, pendulum.DateTime)):  # copied
+    if isinstance(elem, (datetime.datetime,)):  # copied
         return singer_sdk.helpers._typing.to_json_compatible(elem)
     if isinstance(elem, datetime.timedelta):  # copied
         epoch = datetime.datetime.fromtimestamp(0, datetime.timezone.utc)
@@ -115,129 +156,10 @@ class PostgresConnector(SQLConnector):
 
         super().__init__(config=config, sqlalchemy_url=sqlalchemy_url)
 
-    # Note super is static, we can get away with this because this is called once
-    # and is luckily referenced via the instance of the class
-    def to_jsonschema_type(  # type: ignore[override]
-        self,
-        sql_type: str | TypeEngine | type[TypeEngine] | postgresql.ARRAY | Any,
-    ) -> dict:
-        """Return a JSON Schema representation of the provided type.
-
-        Overridden from SQLConnector to correctly handle JSONB and Arrays.
-
-        Also Overridden in order to call our instance method `sdk_typing_object()`
-        instead of the static version
-
-        By default will call `typing.to_jsonschema_type()` for strings and SQLAlchemy
-        types.
-
-        Args:
-            sql_type: The string representation of the SQL type, a SQLAlchemy
-                TypeEngine class or object, or a custom-specified object.
-
-        Raises:
-            ValueError: If the type received could not be translated to jsonschema.
-
-        Returns:
-            The JSON Schema representation of the provided type.
-
-        """
-        type_name = None
-        if isinstance(sql_type, str):
-            type_name = sql_type
-        elif isinstance(sql_type, sa.types.TypeEngine):
-            type_name = type(sql_type).__name__
-
-        if (
-            type_name is not None
-            and isinstance(sql_type, sa.dialects.postgresql.ARRAY)
-            and type_name == "ARRAY"
-        ):
-            array_type = self.sdk_typing_object(sql_type.item_type)
-            return th.ArrayType(array_type).type_dict
-        return self.sdk_typing_object(sql_type).type_dict
-
-    def sdk_typing_object(
-        self,
-        from_type: str | TypeEngine | type[TypeEngine],
-    ) -> (
-        th.DateTimeType
-        | th.NumberType
-        | th.IntegerType
-        | th.DateType
-        | th.StringType
-        | th.BooleanType
-        | th.CustomType
-    ):
-        """Return the JSON Schema dict that describes the sql type.
-
-        Args:
-            from_type: The SQL type as a string or as a TypeEngine. If a TypeEngine is
-                provided, it may be provided as a class or a specific object instance.
-
-        Raises:
-            ValueError: If the `from_type` value is not of type `str` or `TypeEngine`.
-
-        Returns:
-            A compatible JSON Schema type definition.
-        """
-        # NOTE: This is an ordered mapping, with earlier mappings taking precedence. If
-        # the SQL-provided type contains the type name on the left, the mapping will
-        # return the respective singer type.
-        # NOTE: jsonb and json should theoretically be th.AnyType().type_dict but that
-        # causes problems down the line with an error like:
-        # singer_sdk.helpers._typing.EmptySchemaTypeError: Could not detect type from
-        # empty type_dict. Did you forget to define a property in the stream schema?
-        sqltype_lookup: dict[
-            str,
-            th.DateTimeType
-            | th.NumberType
-            | th.IntegerType
-            | th.DateType
-            | th.StringType
-            | th.BooleanType
-            | th.CustomType,
-        ] = {
-            "jsonb": th.CustomType(
-                {"type": ["string", "number", "integer", "array", "object", "boolean"]}
-            ),
-            "json": th.CustomType(
-                {"type": ["string", "number", "integer", "array", "object", "boolean"]}
-            ),
-            "timestamp": th.DateTimeType(),
-            "datetime": th.DateTimeType(),
-            "date": th.DateType(),
-            "int": th.IntegerType(),
-            "numeric": th.NumberType(),
-            "decimal": th.NumberType(),
-            "double": th.NumberType(),
-            "float": th.NumberType(),
-            "string": th.StringType(),
-            "text": th.StringType(),
-            "char": th.StringType(),
-            "bool": th.BooleanType(),
-            "variant": th.StringType(),
-        }
-        if self.config["dates_as_string"] is True:
-            sqltype_lookup["date"] = th.StringType()
-            sqltype_lookup["datetime"] = th.StringType()
-        if isinstance(from_type, str):
-            type_name = from_type
-        elif isinstance(from_type, sa.types.TypeEngine):
-            type_name = type(from_type).__name__
-        elif isinstance(from_type, type) and issubclass(from_type, sa.types.TypeEngine):
-            type_name = from_type.__name__
-        else:
-            raise ValueError(
-                "Expected `str` or a SQLAlchemy `TypeEngine` object or type."
-            )
-
-        # Look for the type name within the known SQL type names:
-        for sqltype, jsonschema_type in sqltype_lookup.items():
-            if sqltype.lower() in type_name.lower():
-                return jsonschema_type
-
-        return sqltype_lookup["string"]  # safe failover to str
+    @functools.cached_property
+    def sql_to_jsonschema(self):
+        """Return a mapping of SQL types to JSON Schema types."""
+        return PostgresSQLToJSONSchema(dates_as_string=self.config["dates_as_string"])
 
     def get_schema_names(self, engine: Engine, inspected: Inspector) -> list[str]:
         """Return a list of schema names in DB, or overrides with user-provided values.
@@ -258,12 +180,18 @@ class PostgresStream(SQLStream):
     """Stream class for Postgres streams."""
 
     connector_class = PostgresConnector
+    supports_nulls_first = True
 
     # JSONB Objects won't be selected without type_conformance_level to ROOT_ONLY
     TYPE_CONFORMANCE_LEVEL = TypeConformanceLevel.ROOT_ONLY
 
-    def get_records(self, context: dict | None) -> Iterable[dict[str, Any]]:
-        """Return a generator of row-type dictionary objects.
+    def max_record_count(self) -> int | None:
+        """Return the maximum number of records to fetch in a single query."""
+        return self.config.get("max_record_count")
+
+    # Get records from stream
+    def get_records(self, context: Context | None) -> t.Iterable[dict[str, t.Any]]:
+        """Return a generator of record-type dictionary objects.
 
         If the stream has a replication_key value defined, records will be sorted by the
         incremental key. If the stream also has an available starting bookmark, the
@@ -281,30 +209,48 @@ class PostgresStream(SQLStream):
                 not support partitioning.
         """
         if context:
-            raise NotImplementedError(
-                f"Stream '{self.name}' does not support partitioning."
-            )
+            msg = f"Stream '{self.name}' does not support partitioning."
+            raise NotImplementedError(msg)
 
-        # pulling rows with only selected columns from stream
-        selected_column_names = [k for k in self.get_selected_schema()["properties"]]
+        selected_column_names = self.get_selected_schema()["properties"].keys()
         table = self.connector.get_table(
-            self.fully_qualified_name, column_names=selected_column_names
+            full_table_name=self.fully_qualified_name,
+            column_names=selected_column_names,
         )
         query = table.select()
+
         if self.replication_key:
             replication_key_col = table.columns[self.replication_key]
-
-            # Nulls first because the default is to have nulls as the "highest" value
-            # which incorrectly causes the tap to attempt to store null state.
-            query = query.order_by(sa.nullsfirst(replication_key_col))
+            order_by = (
+                sa.nulls_first(replication_key_col.asc())
+                if self.supports_nulls_first
+                else replication_key_col.asc()
+            )
+            query = query.order_by(order_by)
 
             start_val = self.get_starting_replication_key_value(context)
             if start_val:
-                query = query.filter(replication_key_col >= start_val)
+                query = query.where(replication_key_col >= start_val)
 
-        with self.connector._connect() as con:
-            for row in con.execute(query).mappings():
-                yield dict(row)
+        if self.ABORT_AT_RECORD_COUNT is not None:
+            # Limit record count to one greater than the abort threshold. This ensures
+            # `MaxRecordsLimitException` exception is properly raised by caller
+            # `Stream._sync_records()` if more records are available than can be
+            # processed.
+            query = query.limit(self.ABORT_AT_RECORD_COUNT + 1)
+
+        if self.max_record_count():
+            query = query.limit(self.max_record_count())
+
+        with self.connector._connect() as conn:
+            for record in conn.execute(query).mappings():
+                # TODO: Standardize record mapping type
+                # https://github.com/meltano/sdk/issues/2096
+                transformed_record = self.post_process(dict(record))
+                if transformed_record is None:
+                    # Record filtered out during post_process()
+                    continue
+                yield transformed_record
 
 
 class PostgresLogBasedStream(SQLStream):
@@ -325,7 +271,7 @@ class PostgresLogBasedStream(SQLStream):
     @cached_property
     def schema(self) -> dict:
         """Override schema for log-based replication adding _sdc columns."""
-        schema_dict = typing.cast(dict, self._singer_catalog_entry.schema.to_dict())
+        schema_dict = t.cast(dict, self._singer_catalog_entry.schema.to_dict())
         for property in schema_dict["properties"].values():
             if isinstance(property["type"], list):
                 property["type"].append("null")
@@ -341,7 +287,7 @@ class PostgresLogBasedStream(SQLStream):
         self,
         latest_record: dict[str, Any],
         *,
-        context: dict | None = None,
+        context: Context | None = None,
     ) -> None:
         """Update state of stream or partition with data from the provided record.
 
@@ -372,7 +318,7 @@ class PostgresLogBasedStream(SQLStream):
                 check_sorted=self.check_sorted,
             )
 
-    def get_records(self, context: dict | None) -> Iterable[dict[str, Any]]:
+    def get_records(self, context: Context | None) -> Iterable[dict[str, Any]]:
         """Return a generator of row-type dictionary objects."""
         status_interval = 5.0  # if no records in 5 seconds the tap can exit
         start_lsn = self.get_starting_replication_key_value(context=context)
@@ -403,7 +349,7 @@ class PostgresLogBasedStream(SQLStream):
         while True:
             message = logical_replication_cursor.read_message()
             if message:
-                row = self.consume(message)
+                row = self.consume(message, logical_replication_cursor)
                 if row:
                     yield row
             else:
@@ -430,7 +376,7 @@ class PostgresLogBasedStream(SQLStream):
         logical_replication_cursor.close()
         logical_replication_connection.close()
 
-    def consume(self, message) -> dict | None:
+    def consume(self, message, cursor) -> dict | None:
         """Ingest WAL message."""
         try:
             message_payload = json.loads(message.payload)
@@ -450,12 +396,12 @@ class PostgresLogBasedStream(SQLStream):
 
         if message_payload["action"] in upsert_actions:
             for column in message_payload["columns"]:
-                row.update({column["name"]: column["value"]})
+                row.update({column["name"]: self._parse_column_value(column, cursor)})
             row.update({"_sdc_deleted_at": None})
             row.update({"_sdc_lsn": message.data_start})
         elif message_payload["action"] in delete_actions:
             for column in message_payload["identity"]:
-                row.update({column["name"]: column["value"]})
+                row.update({column["name"]: self._parse_column_value(column, cursor)})
             row.update(
                 {
                     "_sdc_deleted_at": datetime.datetime.utcnow().strftime(
@@ -490,6 +436,15 @@ class PostgresLogBasedStream(SQLStream):
             )
 
         return row
+
+    def _parse_column_value(self, column, cursor):
+        # When using log based replication, the wal2json output for columns of
+        # array types returns a string encoded in sql format, e.g. '{a,b}'
+        # https://github.com/eulerto/wal2json/issues/221#issuecomment-1025143441
+        if column["type"] == "text[]":
+            return psycopg2.extensions.STRINGARRAY(column["value"], cursor)
+
+        return column["value"]
 
     def logical_replication_connection(self):
         """A logical replication connection to the database.
